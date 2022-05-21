@@ -102,7 +102,15 @@ class LPRHead(nn.Module):
         return features
 
 
-class Model(nn.Module):
+features_pointer = None
+
+
+def forward_hook(module, inputs, outputs):
+    global features_pointer
+    features_pointer = outputs.detach().clone()
+
+
+class LPRNet(nn.Module):
     def __init__(self) -> None:
         super().__init__()
 
@@ -129,7 +137,7 @@ class Model(nn.Module):
             rpn_fg_iou_thresh=0.7,
             rpn_bg_iou_thresh=0.3,
             rpn_batch_size_per_image=256,
-            rpn_post_nms_top_n_train=256,
+            rpn_post_nms_top_n_train=100,
             rpn_post_nms_top_n_test=100,
             box_roi_pool=roi_pooler,
             box_head=TwoMLPHead(
@@ -139,52 +147,73 @@ class Model(nn.Module):
                 representation_size,
             ),
             box_predictor=FastRCNNPredictor(representation_size, 2),
+            # Keep all proposal.
+            box_nms_thresh=1,
+            box_score_thresh=0,
         )
 
-        self.ouput = LPRHead(3, 512)
+        def _hook(model):
+            def _func(module, _input, output):
+                model.roi_pool_out = output.detach().clone()
 
-    def forward(self, x):
-        x = self.detect(x)
-        print(x[0].shape)
+            return _func
+
+        self.output = LPRHead(512 * 100, 512)
+        self.roi_pool_out = None
+        self.detect.roi_heads.box_roi_pool.register_forward_hook(_hook(self))
+
+    def forward(self, x, bbox=None, labels=None):
+        if not self.training:
+            out, labels = self._predict(x)
+            return out, labels
+        else:
+            loss = self._train_step(x, bbox, labels)
+            return loss
+
+    def _predict(self, x):
+        self.detect.eval()
+        self.output.eval()
+        out = self.detect(x)
+
+        # print(self.roi_pool_out.view(len(x), -1, 4, 20).shape)
+        # labels = self.output(self.roi_pool_out.view(-1, 512, 4, 20))
+        labels = self.output(self.roi_pool_out.view(len(x), -1, 4, 20))
+        return out, labels
+
+    def _train_step(self, x, bbox, labels):
+        self.detect.train()
+        self.output.train()
+        # target = dict(image_id=[1 for _ in range(len(bbox))], boxes=bbox)
+        # print(target)
+        target = [
+            {"boxes": b.unsqueeze(0), "labels": torch.ones((1,), dtype=torch.int64)}
+            for b in bbox
+        ]
+        # loss, out = self.detect(x, target)
+        losses = self.detect(x, target)
+        # print(self.roi_pool_out.shape)
+        # pred_labels = self.output(self.roi_pool_out.view(-1, 512, 4, 20))
+
+        # pred_labels = self.output(self.roi_pool_out.view(len(x), -1, 4, 20))
+        # print(pred_labels.shape)
+        loss = (
+            losses["loss_classifier"]
+            + losses["loss_box_reg"]
+            # + nn.CTCLoss()(pred_labels, labels, len(pred_labels), len(labels))
+        )
+        return loss
 
 
-backbone = torchvision.models.vgg16(pretrained=True).features
-backbone.out_channels = 512
-anchor_generator = AnchorGenerator(
-    sizes=((5, 8, 11, 14, 17, 20),), aspect_ratios=((0.2),)
-)
-rpn_head = LPRRPNHead(
-    in_channels=backbone.out_channels,
-    num_anchors=anchor_generator.num_anchors_per_location()[0],
-)
-
-roi_pooler = torchvision.ops.MultiScaleRoIAlign(
-    featmap_names=["0"], output_size=(4, 20), sampling_ratio=2
-)
-
-representation_size = 2048
-detect = FasterRCNN(
-    backbone=backbone,
-    # RPN
-    rpn_anchor_generator=anchor_generator,
-    rpn_head=rpn_head,
-    rpn_fg_iou_thresh=0.7,
-    rpn_bg_iou_thresh=0.3,
-    rpn_batch_size_per_image=256,
-    rpn_post_nms_top_n_train=256,
-    rpn_post_nms_top_n_test=100,
-    box_roi_pool=roi_pooler,
-    box_head=TwoMLPHead(
-        backbone.out_channels * roi_pooler.output_size[0] * roi_pooler.output_size[1],
-        representation_size,
-    ),
-    box_predictor=FastRCNNPredictor(representation_size, 2),
-)
-a = torch.rand(3, 200, 200)
-detect.eval()
-out = detect([a])
-detect.eval()
-print(out[0]["boxes"][0])
-print(out[0])
-# ctc_loss = torch.nn.CTC()
+# a = torch.rand(3, 200, 200)
+# detect.eval()
+# out = detect([a, a])
+# print(detect.roi_heads.box_roi_pool)
+# print(out[0]["boxes"][0])
+# print(out[0])
 # print(cls(a.unsqueeze(0)).shape)
+# ctc_loss = torch.nn.CTCLoss()
+
+# m = LPRNet()
+# m.eval()
+# detection, labels = m([a, a])
+# print(detection[0]["boxes"].shape)
